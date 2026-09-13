@@ -1,7 +1,11 @@
 """
-Core agent logic: turns a TravelSearchRequest into a validated list of PointOfInterest objects by calling Claude with a forced tool call.
+Core agent logic: turns a TravelSearchRequest into a validated list of
+PointOfInterest objects by calling Claude with a forced tool call.
 
-Why forced tool calling instead of "ask for JSON in the prompt": Claude will always emit a single, schema-valid tool_use block when tool_choice pins it to one tool. That removes the need for regex/JSON repair on the response — Pydantic just validates the tool input directly.
+Why forced tool calling instead of "ask for JSON in the prompt":
+Claude will always emit a single, schema-valid tool_use block when
+tool_choice pins it to one tool. That removes the need for regex/JSON
+repair on the response — Pydantic just validates the tool input directly.
 """
 
 import json
@@ -17,8 +21,12 @@ logger = logging.getLogger("travel_agent")
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
+# --------------------------------------------------------------------------- #
 # System prompt
-# This is the agent's entire personality and rulebook. Keep it here (not in main.py) so it can be versioned, unit tested, and swapped independently of the endpoint that calls it.
+# --------------------------------------------------------------------------- #
+# This is the agent's entire personality and rulebook. Keep it here (not in
+# main.py) so it can be versioned, unit tested, and swapped independently of
+# the endpoint that calls it.
 
 SYSTEM_PROMPT = """\
 You are a Travel Data Retrieval Agent. You research and return real, \
@@ -47,7 +55,7 @@ CORE RULES — NEVER BREAK THESE:
    (entry ticket, average meal cost, activity fee). Bias toward leaving \
    headroom under the budget rather than hitting it exactly.
 
-4. PACING AND VOLUME.
+4. PACING, VOLUME, AND HARD CAP.
    Use `days`, `hours_per_day`, and `pacing` to decide how many POIs to \
    return in total:
    - Relaxed:  roughly 2 stops per active day, longer dwell times.
@@ -55,6 +63,19 @@ CORE RULES — NEVER BREAK THESE:
    - Intense:  roughly 5-6 stops per active day, tighter schedule_labels.
    Each POI's schedule_label should reflect a realistic time allocation \
    that could fit inside hours_per_day when combined with the others.
+   HARD LIMIT: never return more than (days * 8) POIs in total, no matter \
+   what. If the requested city, categories, or other filters seem too \
+   narrow to fill that many good real places, return FEWER POIs rather \
+   than inventing or padding the list — quality and realism always win \
+   over hitting a target count.
+
+4b. IF THE CITY IS AMBIGUOUS OR NOT A REAL CITY.
+   If the `city` value looks like a landmark, mall, or business name rather \
+   than an actual city or town (e.g. a shopping center name), treat its \
+   surrounding city as the actual search area if you can reasonably infer \
+   it, and center the trip there. If you cannot infer a real city at all, \
+   return the smallest reasonable set of well-known POIs near that \
+   location rather than an unbounded or repetitive list.
 
 5. MEALS.
    Include exactly `meals_per_day * days` POIs categorized as restaurant \
@@ -165,8 +186,13 @@ def _build_user_prompt(payload: TravelSearchRequest) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
 # Tool definition — the JSON schema Claude is forced to fill in.
-# Built by hand (rather than PointOfInterest.model_json_schema()) so the field-level `description`s can carry the same behavioral hints as the system prompt; the LLM tends to respect descriptions on the tool schema even more literally than prose earlier in context.
+# Built by hand (rather than PointOfInterest.model_json_schema()) so the
+# field-level `description`s can carry the same behavioral hints as the
+# system prompt; the LLM tends to respect descriptions on the tool schema
+# even more literally than prose earlier in context.
+# --------------------------------------------------------------------------- #
 
 RETURN_POIS_TOOL = {
     "name": "return_pois",
@@ -229,7 +255,8 @@ async def generate_pois(payload: TravelSearchRequest) -> list[PointOfInterest]:
         max_tokens=settings.max_tokens,
         system=SYSTEM_PROMPT,
         tools=[RETURN_POIS_TOOL],
-        # Pinning tool_choice to this exact tool is what guarantees a structured response instead of a free-text one.
+        # Pinning tool_choice to this exact tool is what guarantees a
+        # structured response instead of a free-text one.
         tool_choice={"type": "tool", "name": "return_pois"},
         messages=[{"role": "user", "content": _build_user_prompt(payload)}],
     )
@@ -242,15 +269,65 @@ async def generate_pois(payload: TravelSearchRequest) -> list[PointOfInterest]:
         logger.error("Claude response had no tool_use block: %s", response.content)
         raise ValueError("Agent did not return a structured tool call.")
 
+    if response.stop_reason == "max_tokens":
+        # The response was cut off mid-generation — raw_pois is likely
+        # incomplete/malformed JSON at this point. Fail loudly with a clear
+        # message instead of trying to salvage a truncated tool call.
+        logger.error(
+            "Claude hit max_tokens (%d) while generating POIs for %s — response was truncated.",
+            settings.max_tokens,
+            payload.city,
+        )
+        raise ValueError(
+            "Agent response was truncated (max_tokens reached). "
+            "Try a smaller trip (fewer days/meals) or raise max_tokens."
+        )
+
     raw_pois = tool_use_block.input.get("pois", [])
+
+    # Defensive: occasionally the model returns `pois` as a JSON-encoded
+    # string instead of a native array (e.g. the whole tool input gets
+    # re-serialized and nested as a string value). If we don't catch this,
+    # iterating over it below walks character-by-character instead of
+    # element-by-element.
+    if isinstance(raw_pois, str):
+        logger.warning("`pois` came back as a string instead of a list — attempting to parse it as JSON.")
+        try:
+            parsed = json.loads(raw_pois)
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse malformed `pois` string: %s", exc)
+            raise ValueError("Agent returned a malformed (non-array) POI list that could not be recovered.")
+        raw_pois = parsed.get("pois", []) if isinstance(parsed, dict) else parsed
+
+    if not isinstance(raw_pois, list):
+        raise ValueError(f"Agent's `pois` field was not a list after parsing (got {type(raw_pois).__name__}).")
+
     logger.info("Claude returned %d raw POIs for %s", len(raw_pois), payload.city)
 
-    # Validate every entry individually so one malformed POI doesn't discard an otherwise-good response.
+    # Defense in depth: the system prompt tells Claude to cap output at
+    # (days * 8), but that's a soft instruction — a confused or runaway
+    # generation can still blow past it. Enforce a hard ceiling in code so
+    # we never try to validate/process thousands of entries.
+    hard_cap = payload.days * 10
+    if len(raw_pois) > hard_cap:
+        logger.warning(
+            "Claude returned %d POIs, way above the expected cap of %d for a %d-day trip — truncating.",
+            len(raw_pois), hard_cap, payload.days,
+        )
+        raw_pois = raw_pois[:hard_cap]
+
+    # Validate every entry individually so one malformed POI doesn't
+    # discard an otherwise-good response.
     validated: list[PointOfInterest] = []
     for entry in raw_pois:
+        if not isinstance(entry, dict):
+            # Guards against malformed/truncated tool output where an
+            # array element isn't even a proper object (e.g. a stray string).
+            logger.warning("Dropping malformed POI entry (not an object): %r", entry)
+            continue
         try:
             validated.append(PointOfInterest(**entry))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — deliberately broad, we just log and skip
             logger.warning("Dropping malformed POI %s: %s", entry.get("name", "?"), exc)
 
     if not validated:

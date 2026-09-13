@@ -15,7 +15,7 @@ logger = logging.getLogger("travel_agent")
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 # System prompt
-# This is the agent s entire personality and rulebook
+# This is the agent's entire personality and rulebook
 
 SYSTEM_PROMPT = """\
 You are a Travel Data Retrieval Agent. You research and return real, \
@@ -104,8 +104,6 @@ def _build_user_prompt(payload: TravelSearchRequest) -> str:
     )
 
 # Tool definition — the JSON schema Claude is forced to fill in
-# Built by hand (rather than PointOfInterest.model_json_schema()) so the field-level description s can carry the same behavioral hints as the system prompt; the LLM tends to respect descriptions on the tool schema even more literally than prose earlier in context.
-
 RETURN_POIS_TOOL = {
     "name": "return_pois",
     "description": "Return the final, validated list of Points of Interest for this trip.",
@@ -154,12 +152,17 @@ RETURN_POIS_TOOL = {
 async def generate_pois(payload: TravelSearchRequest) -> list[PointOfInterest]:
     """
     Calls Claude with the system prompt + filters, forces the return_pois tool call, and returns a validated list of PointOfInterest objects.
-    Raises ValueError: if Claude doesn't return a usable tool_use block, or the tool input fails Pydantic validation (caught upstream in main.py and turned into a 502).
     """
     response = await client.messages.create(
         model=settings.anthropic_model,
         max_tokens=settings.max_tokens,
-        system=SYSTEM_PROMPT,
+        system=[
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         tools=[RETURN_POIS_TOOL],
         tool_choice={"type": "tool", "name": "return_pois"},
         messages=[{"role": "user", "content": _build_user_prompt(payload)}],
@@ -174,15 +177,28 @@ async def generate_pois(payload: TravelSearchRequest) -> list[PointOfInterest]:
         raise ValueError("Agent did not return a structured tool call.")
 
     raw_pois = tool_use_block.input.get("pois", [])
+    
+    # --- PLASĂ DE SIGURANȚĂ: Dacă LLM-ul returnează un string în loc de array, îl parsăm noi
+    if isinstance(raw_pois, str):
+        try:
+            raw_pois = json.loads(raw_pois)
+        except json.JSONDecodeError:
+            raise ValueError("Agent returned a malformed JSON string.")
+
     logger.info("Claude returned %d raw POIs for %s", len(raw_pois), payload.city)
 
     # Validate every entry individually so one malformed POI doesn't discard an otherwise-good response.
     validated: list[PointOfInterest] = []
     for entry in raw_pois:
+        # Încă o plasă de siguranță: ignorăm dacă intrarea nu este un dicționar
+        if not isinstance(entry, dict):
+            continue
+            
         try:
             validated.append(PointOfInterest(**entry))
         except Exception as exc:
-            logger.warning("Dropping malformed POI %s: %s", entry.get("name", "?"), exc)
+            poi_name = entry.get("name", "?")
+            logger.warning("Dropping malformed POI %s: %s", poi_name, exc)
  
     if not validated:
         raise ValueError("Agent returned zero valid POIs after schema validation.")
